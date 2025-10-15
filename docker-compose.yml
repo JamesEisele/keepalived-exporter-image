@@ -1,0 +1,6 @@
+services:
+  keepalived-exporter:
+    image: ghcr.io/jameseisele/keepalived-exporter:latest
+    ports:
+      - "9650:9650"
+    restart: unless-stopped

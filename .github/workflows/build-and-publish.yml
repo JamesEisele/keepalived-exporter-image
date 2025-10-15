@@ -1,0 +1,209 @@
+name: Build and Publish Docker Image
+
+on:
+  schedule:
+    # Check for new releases every day at 4 AM UTC.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version to build (e.g. v0.7.1)'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if SHA unchanged'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM_REPO: gen2brain/keepalived_exporter
+  IMAGE_NAME: keepalived-exporter
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Manual trigger with version: $VERSION"
+          else
+            LATEST=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r .tag_name)
+            echo "version=$LATEST" >> $GITHUB_OUTPUT
+            echo "Latest upstream version: $LATEST"
+          fi
+
+      - name: Get commit SHA for version tag
+        id: sha_check
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          # Get commit SHA for tag from upstream:
+          TAG_INFO=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/ref/tags/$VERSION)
+          COMMIT_SHA=$(echo "$TAG_INFO" | jq -r .object.sha)
+
+          # If annotated tag, dereference it:
+          if [ "$(echo "$TAG_INFO" | jq -r .object.type)" = "tag" ]; then
+            TAG_OBJECT=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/tags/$COMMIT_SHA)
+            COMMIT_SHA=$(echo "$TAG_OBJECT" | jq -r .object.sha)
+          fi
+
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "Upstream $VERSION points to commit: $COMMIT_SHA"
+
+          # Check versions.json for working version:
+          RECORDED_SHA=$(jq -r ".versions[\"$VERSION\"] // empty" versions.json)
+
+          if [ -z "$RECORDED_SHA" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "reason=new_version" >> $GITHUB_OUTPUT
+            echo "New version detected"
+          elif [ "$RECORDED_SHA" != "$COMMIT_SHA" ]; then
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "reason=sha_mismatch" >> $GITHUB_OUTPUT
+            echo "recorded_sha=$RECORDED_SHA" >> $GITHUB_OUTPUT
+            echo "::warning::⚠️ SECURITY ALERT: Tag $VERSION has changed from $RECORDED_SHA to $COMMIT_SHA"
+            echo "::error::Upstream tag has been rewritten! This may indicate an upstream compromise. Use force_rebuild=true to override."
+          elif [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rebuild" >> $GITHUB_OUTPUT
+            echo "Force rebuild requested"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "reason=already_built" >> $GITHUB_OUTPUT
+            echo "Version already built with matching SHA"
+          fi
+
+      - name: Exit if SHA mismatch detected
+        if: steps.sha_check.outputs.reason == 'sha_mismatch'
+        run: |
+          echo "::error::Build halted due to SHA mismatch. See warning above for details."
+          exit 1
+
+      - name: Clone upstream repository at specific commit
+        if: steps.sha_check.outputs.should_build == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          COMMIT_SHA="${{ steps.sha_check.outputs.commit_sha }}"
+
+          # Clone and checkout the specific commit (immutable)
+          git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+          cd upstream
+          git checkout "$COMMIT_SHA"
+          cd ..
+
+          echo "Cloned upstream at $VERSION (commit: $COMMIT_SHA)"
+          ls -la upstream/
+
+      - name: Setup QEMU
+        if: steps.sha_check.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        if: steps.sha_check.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub
+        if: steps.sha_check.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        if: steps.sha_check.outputs.should_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.version }}
+            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.upstream.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=keepalived-exporter
+            org.opencontainers.image.description=Prometheus exporter for Keepalived metrics
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ steps.sha_check.outputs.commit_sha }}
+            io.github.keepalived-exporter.upstream-commit=${{ steps.sha_check.outputs.commit_sha }}
+            io.github.keepalived-exporter.upstream-version=${{ steps.upstream.outputs.version }}
+
+      - name: Build and push image
+        if: steps.sha_check.outputs.should_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update versions.json
+        if: steps.sha_check.outputs.should_build == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          COMMIT_SHA="${{ steps.sha_check.outputs.commit_sha }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq --arg ver "$VERSION" --arg sha "$COMMIT_SHA" --arg ts "$TIMESTAMP" \
+            '.versions[$ver] = $sha | .last_checked = $ts' \
+            versions.json > versions.json.tmp
+          mv versions.json.tmp versions.json
+
+          cat versions.json
+
+      - name: Commit versions.json
+        if: steps.sha_check.outputs.should_build == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          COMMIT_SHA="${{ steps.sha_check.outputs.commit_sha }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "Track $VERSION (commit: ${COMMIT_SHA:0:7})"
+          git push
+
+      - name: Build summary
+        if: steps.sha_check.outputs.should_build == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          COMMIT_SHA="${{ steps.sha_check.outputs.commit_sha }}"
+
+          echo "## Built and published $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream commit:** \`$COMMIT_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Image tags" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Security" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit SHA tracked in \`versions.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image labels include upstream commit" >> $GITHUB_STEP_SUMMARY
+
+      - name: Skip summary
+        if: steps.sha_check.outputs.should_build == 'false' && steps.sha_check.outputs.reason == 'already_built'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          echo "## Skipped build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version $VERSION already built with matching SHA." >> $GITHUB_STEP_SUMMARY
