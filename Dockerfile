@@ -12,7 +12,9 @@ COPY . .
 
 RUN CGO_ENABLED=0 go build -o keepalived_exporter -trimpath -ldflags "-s -w"
 
-FROM scratch
+FROM alpine:latest
+
+RUN apk add --no-cache kmod
 
 COPY --from=build /build/keepalived_exporter /keepalived_exporter
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
