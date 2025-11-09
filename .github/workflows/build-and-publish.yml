@@ -41,7 +41,8 @@ jobs:
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "Manual trigger with version: $VERSION"
           else
-            LATEST=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r .tag_name)
+            LATEST=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r .tag_name)
             echo "version=$LATEST" >> $GITHUB_OUTPUT
             echo "Latest upstream version: $LATEST"
           fi
@@ -51,14 +52,37 @@ jobs:
         run: |
           VERSION="${{ steps.upstream.outputs.version }}"
 
-          # Get commit SHA for tag from upstream:
-          TAG_INFO=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/ref/tags/$VERSION)
+          # Get commit SHA for tag from upstream (authenticated to avoid rate limits):
+          TAG_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/ref/tags/$VERSION)
+
+          # Check for API errors
+          if echo "$TAG_INFO" | jq -e .message > /dev/null 2>&1; then
+            echo "::error::GitHub API error: $(echo "$TAG_INFO" | jq -r .message)"
+            exit 1
+          fi
+
           COMMIT_SHA=$(echo "$TAG_INFO" | jq -r .object.sha)
+
+          # Validate we got a SHA
+          if [ "$COMMIT_SHA" = "null" ] || [ -z "$COMMIT_SHA" ]; then
+            echo "::error::Failed to get commit SHA for tag $VERSION"
+            echo "API Response: $TAG_INFO"
+            exit 1
+          fi
 
           # If annotated tag, dereference it:
           if [ "$(echo "$TAG_INFO" | jq -r .object.type)" = "tag" ]; then
-            TAG_OBJECT=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/tags/$COMMIT_SHA)
+            TAG_OBJECT=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/git/tags/$COMMIT_SHA)
             COMMIT_SHA=$(echo "$TAG_OBJECT" | jq -r .object.sha)
+
+            # Validate dereferenced SHA
+            if [ "$COMMIT_SHA" = "null" ] || [ -z "$COMMIT_SHA" ]; then
+              echo "::error::Failed to dereference annotated tag $VERSION"
+              echo "API Response: $TAG_OBJECT"
+              exit 1
+            fi
           fi
 
           echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
